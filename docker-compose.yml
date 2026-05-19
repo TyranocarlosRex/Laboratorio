@@ -1,0 +1,8 @@
+services:
+  laboratorio-api:
+    build: .
+    container_name: laboratorio-api
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    ports:
+      - "8000:8000"
