@@ -31,7 +31,10 @@ def test_contract_metadata_and_paths() -> None:
 
     expected_paths = {
         "/",
+        "/auth/bootstrap",
+        "/auth/login",
         "/health",
+        "/ready",
         "/sustancias",
         "/sustancias/alertas",
         "/sustancias/{sustancia_id}",
@@ -46,6 +49,9 @@ def test_contract_metadata_and_paths() -> None:
 def test_resource_methods_are_part_of_the_contract() -> None:
     paths = contract()["paths"]
 
+    assert set(paths["/auth/bootstrap"]) == {"post"}
+    assert set(paths["/auth/login"]) == {"post"}
+    assert set(paths["/ready"]) == {"get"}
     assert set(paths["/sustancias"]) == {"get", "post"}
     assert set(paths["/sustancias/{sustancia_id}"]) == {"get", "put", "delete"}
     assert set(paths["/sustancias/alertas"]) == {"get"}
@@ -57,6 +63,8 @@ def test_resource_methods_are_part_of_the_contract() -> None:
 
 def test_create_and_update_payloads_do_not_accept_client_ids() -> None:
     expected_payloads = {
+        "AdminBootstrapCreate": {"nombre", "contrasena"},
+        "AuthLoginRequest": {"nombre", "contrasena"},
         "SustanciaCreate": {
             "nombre",
             "categoria",
@@ -121,9 +129,27 @@ def test_response_models_keep_server_generated_fields_private() -> None:
         "movimiento",
         "sustancia",
     }
+    assert properties("AuthTokenResponse") == {
+        "access_token",
+        "token_type",
+        "expires_in",
+        "usuario",
+    }
+    assert properties("AuthUserResponse") == {"id", "nombre", "rol"}
 
 
 def test_endpoint_payload_and_response_refs() -> None:
+    assert request_ref("/auth/bootstrap", "post") == (
+        "#/components/schemas/AdminBootstrapCreate"
+    )
+    assert schema_ref("/auth/bootstrap", "post", "201") == (
+        "#/components/schemas/UsuarioResponse"
+    )
+    assert request_ref("/auth/login", "post") == "#/components/schemas/AuthLoginRequest"
+    assert schema_ref("/auth/login", "post", "200") == (
+        "#/components/schemas/AuthTokenResponse"
+    )
+
     assert request_ref("/sustancias", "post") == "#/components/schemas/SustanciaCreate"
     assert schema_ref("/sustancias", "post", "201") == "#/components/schemas/SustanciaResponse"
     assert request_ref("/sustancias/{sustancia_id}", "put") == (

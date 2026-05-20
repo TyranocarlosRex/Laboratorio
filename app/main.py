@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-import hashlib
 from contextlib import asynccontextmanager
 from typing import Annotated, Mapping, Any
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jwt import ExpiredSignatureError, InvalidTokenError
 
-from app.database import execute_insert, get_db, init_db
+from app.config import allowed_origins, check_runtime_config
+from app.database import check_database_ready, execute_insert, get_db, init_db
 from app.schemas import (
+    AdminBootstrapCreate,
+    AuthLoginRequest,
+    AuthTokenResponse,
     MessageResponse,
     MovimientoCreate,
     MovimientoCreatedResponse,
@@ -22,6 +27,13 @@ from app.schemas import (
     UsuarioUpdate,
     normalize_movement_type,
     normalize_risk_level,
+)
+from app.security import (
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    password_needs_rehash,
+    verify_password,
 )
 
 
@@ -40,15 +52,16 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins(),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-def _hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+bearer_scheme = HTTPBearer(auto_error=False)
+READ_ROLES = ("administrador", "responsable", "consultor")
+WRITE_ROLES = ("administrador", "responsable")
+ADMIN_ROLES = ("administrador",)
 
 
 def _row_to_dict(row: Mapping[str, Any]) -> dict:
@@ -86,9 +99,41 @@ def _get_sustancia_or_404(connection, sustancia_id: int) -> Mapping[str, Any]:
     return row
 
 
+def _get_sustancia_for_update_or_404(
+    connection,
+    sustancia_id: int,
+) -> Mapping[str, Any]:
+    row = connection.execute(
+        "SELECT * FROM sustancias WHERE id = ? FOR UPDATE",
+        (sustancia_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Sustancia no encontrada",
+        )
+    return row
+
+
 def _get_movimiento_or_404(connection, movimiento_id: int) -> Mapping[str, Any]:
     row = connection.execute(
         "SELECT * FROM movimientos WHERE id = ?",
+        (movimiento_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Movimiento no encontrado",
+        )
+    return row
+
+
+def _get_movimiento_for_update_or_404(
+    connection,
+    movimiento_id: int,
+) -> Mapping[str, Any]:
+    row = connection.execute(
+        "SELECT * FROM movimientos WHERE id = ? FOR UPDATE",
         (movimiento_id,),
     ).fetchone()
     if row is None:
@@ -112,8 +157,106 @@ def _get_usuario_or_404(connection, usuario_id: int) -> Mapping[str, Any]:
     return row
 
 
+def _get_usuario_auth_by_nombre(
+    connection,
+    nombre: str,
+) -> Mapping[str, Any] | None:
+    return connection.execute(
+        """
+        SELECT id, nombre, contrasena, rol, created_at, updated_at
+        FROM usuarios
+        WHERE LOWER(nombre) = LOWER(?)
+        """,
+        (nombre,),
+    ).fetchone()
+
+
+def _get_usuario_public_by_id(connection, usuario_id: int) -> Mapping[str, Any] | None:
+    return connection.execute(
+        "SELECT id, nombre, rol, created_at, updated_at FROM usuarios WHERE id = ?",
+        (usuario_id,),
+    ).fetchone()
+
+
+def _ensure_usuario_name_available(
+    connection,
+    nombre: str,
+    current_user_id: int | None = None,
+) -> None:
+    row = connection.execute(
+        "SELECT id FROM usuarios WHERE LOWER(nombre) = LOWER(?)",
+        (nombre,),
+    ).fetchone()
+
+    if row is not None and row["id"] != current_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ya existe un usuario con ese nombre",
+        )
+
+
+def _unauthorized(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def get_current_user(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None,
+        Depends(bearer_scheme),
+    ],
+) -> dict:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise _unauthorized("Token de autenticacion requerido")
+
+    try:
+        payload = decode_access_token(credentials.credentials)
+    except ExpiredSignatureError as error:
+        raise _unauthorized("Token expirado") from error
+    except InvalidTokenError as error:
+        raise _unauthorized("Token invalido") from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
+
+    try:
+        usuario_id = int(payload.get("sub", ""))
+    except (TypeError, ValueError) as error:
+        raise _unauthorized("Token invalido") from error
+
+    with get_db() as connection:
+        usuario = _get_usuario_public_by_id(connection, usuario_id)
+
+    if usuario is None:
+        raise _unauthorized("Usuario no encontrado")
+
+    return _row_to_dict(usuario)
+
+
+def require_roles(*allowed_roles: str):
+    def dependency(current_user: Annotated[dict, Depends(get_current_user)]) -> dict:
+        if current_user["rol"] not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No tienes permisos para esta operacion",
+            )
+        return current_user
+
+    return dependency
+
+
 def _movement_delta(tipo: str, cantidad: float) -> float:
     return cantidad if tipo == "entrada" else -cantidad
+
+
+def _lock_sustancias_for_update(connection, sustancia_ids: list[int]) -> None:
+    for sustancia_id in sorted(set(sustancia_ids)):
+        _get_sustancia_for_update_or_404(connection, sustancia_id)
 
 
 def _update_sustancia_quantity(
@@ -121,7 +264,7 @@ def _update_sustancia_quantity(
     sustancia_id: int,
     delta: float,
 ) -> Mapping[str, Any]:
-    sustancia = _get_sustancia_or_404(connection, sustancia_id)
+    sustancia = _get_sustancia_for_update_or_404(connection, sustancia_id)
     nueva_cantidad = float(sustancia["cantidad"]) + delta
 
     if nueva_cantidad < 0:
@@ -148,6 +291,8 @@ def root() -> dict:
         "mensaje": "Laboratorio API REST",
         "docs": "/docs",
         "health": "/health",
+        "ready": "/ready",
+        "login": "/auth/login",
     }
 
 
@@ -156,10 +301,114 @@ def health_check() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/ready", tags=["Sistema"])
+def readiness_check() -> dict:
+    try:
+        check_runtime_config()
+        check_database_ready()
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Base de datos no disponible",
+        ) from error
+
+    return {"status": "ready", "database": "ok", "auth": "ok"}
+
+
+@app.post(
+    "/auth/bootstrap",
+    status_code=status.HTTP_201_CREATED,
+    response_model=UsuarioResponse,
+    tags=["Autenticacion"],
+)
+def bootstrap_admin(usuario: AdminBootstrapCreate) -> dict:
+    with get_db() as connection:
+        total_usuarios = connection.execute(
+            "SELECT COUNT(*) AS total FROM usuarios"
+        ).fetchone()["total"]
+
+        if total_usuarios > 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="El administrador inicial ya fue configurado",
+            )
+
+        _ensure_usuario_name_available(connection, usuario.nombre)
+        created_id = execute_insert(
+            connection,
+            """
+            INSERT INTO usuarios (
+                nombre,
+                contrasena,
+                rol,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 'administrador', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (usuario.nombre, hash_password(usuario.contrasena)),
+        )
+        return _row_to_dict(_get_usuario_or_404(connection, created_id))
+
+
+@app.post(
+    "/auth/login",
+    response_model=AuthTokenResponse,
+    tags=["Autenticacion"],
+)
+def login_usuario(credentials: AuthLoginRequest) -> dict:
+    with get_db() as connection:
+        usuario = _get_usuario_auth_by_nombre(connection, credentials.nombre)
+
+        if usuario is None or not verify_password(
+            credentials.contrasena,
+            usuario["contrasena"],
+        ):
+            raise _unauthorized("Credenciales invalidas")
+
+        if password_needs_rehash(usuario["contrasena"]):
+            connection.execute(
+                """
+                UPDATE usuarios
+                SET contrasena = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (hash_password(credentials.contrasena), usuario["id"]),
+            )
+
+        public_usuario = _row_to_dict(_get_usuario_or_404(connection, usuario["id"]))
+
+    try:
+        access_token, expires_in = create_access_token(public_usuario)
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "usuario": {
+            "id": public_usuario["id"],
+            "nombre": public_usuario["nombre"],
+            "rol": public_usuario["rol"],
+        },
+    }
+
+
 @app.get(
     "/sustancias/alertas",
     response_model=list[SustanciaResponse],
     tags=["Sustancias"],
+    dependencies=[Depends(require_roles(*READ_ROLES))],
 )
 def get_alertas_inventario() -> list[dict]:
     with get_db() as connection:
@@ -175,6 +424,7 @@ def get_alertas_inventario() -> list[dict]:
     "/sustancias",
     response_model=list[SustanciaResponse],
     tags=["Sustancias"],
+    dependencies=[Depends(require_roles(*READ_ROLES))],
 )
 def get_sustancias(
     nombre: Annotated[str | None, Query(description="Busqueda parcial por nombre")] = None,
@@ -229,6 +479,7 @@ def get_sustancias(
     "/sustancias/{sustancia_id}",
     response_model=SustanciaResponse,
     tags=["Sustancias"],
+    dependencies=[Depends(require_roles(*READ_ROLES))],
 )
 def get_sustancia(sustancia_id: int) -> dict:
     with get_db() as connection:
@@ -240,6 +491,7 @@ def get_sustancia(sustancia_id: int) -> dict:
     status_code=status.HTTP_201_CREATED,
     response_model=SustanciaResponse,
     tags=["Sustancias"],
+    dependencies=[Depends(require_roles(*WRITE_ROLES))],
 )
 def create_sustancia(sustancia: SustanciaCreate) -> dict:
     with get_db() as connection:
@@ -281,10 +533,11 @@ def create_sustancia(sustancia: SustanciaCreate) -> dict:
     "/sustancias/{sustancia_id}",
     response_model=SustanciaResponse,
     tags=["Sustancias"],
+    dependencies=[Depends(require_roles(*WRITE_ROLES))],
 )
 def update_sustancia(sustancia_id: int, sustancia: SustanciaUpdate) -> dict:
     with get_db() as connection:
-        _get_sustancia_or_404(connection, sustancia_id)
+        _get_sustancia_for_update_or_404(connection, sustancia_id)
         connection.execute(
             """
             UPDATE sustancias
@@ -321,10 +574,11 @@ def update_sustancia(sustancia_id: int, sustancia: SustanciaUpdate) -> dict:
     "/sustancias/{sustancia_id}",
     response_model=MessageResponse,
     tags=["Sustancias"],
+    dependencies=[Depends(require_roles(*WRITE_ROLES))],
 )
 def delete_sustancia(sustancia_id: int) -> dict:
     with get_db() as connection:
-        _get_sustancia_or_404(connection, sustancia_id)
+        _get_sustancia_for_update_or_404(connection, sustancia_id)
         movements_count = connection.execute(
             "SELECT COUNT(*) AS total FROM movimientos WHERE id_sustancia = ?",
             (sustancia_id,),
@@ -344,6 +598,7 @@ def delete_sustancia(sustancia_id: int) -> dict:
     "/movimientos",
     response_model=list[MovimientoResponse],
     tags=["Movimientos"],
+    dependencies=[Depends(require_roles(*READ_ROLES))],
 )
 def get_movimientos(
     id_sustancia: Annotated[int | None, Query(gt=0)] = None,
@@ -373,6 +628,7 @@ def get_movimientos(
     "/movimientos/{movimiento_id}",
     response_model=MovimientoResponse,
     tags=["Movimientos"],
+    dependencies=[Depends(require_roles(*READ_ROLES))],
 )
 def get_movimiento(movimiento_id: int) -> dict:
     with get_db() as connection:
@@ -384,10 +640,15 @@ def get_movimiento(movimiento_id: int) -> dict:
     status_code=status.HTTP_201_CREATED,
     response_model=MovimientoCreatedResponse,
     tags=["Movimientos"],
+    dependencies=[Depends(require_roles(*WRITE_ROLES))],
 )
 def create_movimiento(movimiento: MovimientoCreate) -> dict:
     with get_db() as connection:
-        _get_sustancia_or_404(connection, movimiento.id_sustancia)
+        updated_sustancia = _update_sustancia_quantity(
+            connection,
+            movimiento.id_sustancia,
+            _movement_delta(movimiento.tipo, movimiento.cantidad),
+        )
 
         created_id = execute_insert(
             connection,
@@ -408,11 +669,6 @@ def create_movimiento(movimiento: MovimientoCreate) -> dict:
                 movimiento.motivo,
             ),
         )
-        updated_sustancia = _update_sustancia_quantity(
-            connection,
-            movimiento.id_sustancia,
-            _movement_delta(movimiento.tipo, movimiento.cantidad),
-        )
 
         created_movement = _get_movimiento_or_404(connection, created_id)
 
@@ -427,11 +683,15 @@ def create_movimiento(movimiento: MovimientoCreate) -> dict:
     "/movimientos/{movimiento_id}",
     response_model=MovimientoResponse,
     tags=["Movimientos"],
+    dependencies=[Depends(require_roles(*WRITE_ROLES))],
 )
 def update_movimiento(movimiento_id: int, movimiento: MovimientoUpdate) -> dict:
     with get_db() as connection:
-        old_movement = _get_movimiento_or_404(connection, movimiento_id)
-        _get_sustancia_or_404(connection, movimiento.id_sustancia)
+        old_movement = _get_movimiento_for_update_or_404(connection, movimiento_id)
+        _lock_sustancias_for_update(
+            connection,
+            [old_movement["id_sustancia"], movimiento.id_sustancia],
+        )
 
         old_delta = _movement_delta(
             old_movement["tipo"],
@@ -481,10 +741,11 @@ def update_movimiento(movimiento_id: int, movimiento: MovimientoUpdate) -> dict:
     "/movimientos/{movimiento_id}",
     response_model=MessageResponse,
     tags=["Movimientos"],
+    dependencies=[Depends(require_roles(*WRITE_ROLES))],
 )
 def delete_movimiento(movimiento_id: int) -> dict:
     with get_db() as connection:
-        movimiento = _get_movimiento_or_404(connection, movimiento_id)
+        movimiento = _get_movimiento_for_update_or_404(connection, movimiento_id)
         _update_sustancia_quantity(
             connection,
             movimiento["id_sustancia"],
@@ -498,6 +759,7 @@ def delete_movimiento(movimiento_id: int) -> dict:
     "/usuarios",
     response_model=list[UsuarioResponse],
     tags=["Usuarios"],
+    dependencies=[Depends(require_roles(*ADMIN_ROLES))],
 )
 def get_usuarios() -> list[dict]:
     with get_db() as connection:
@@ -511,6 +773,7 @@ def get_usuarios() -> list[dict]:
     "/usuarios/{usuario_id}",
     response_model=UsuarioResponse,
     tags=["Usuarios"],
+    dependencies=[Depends(require_roles(*ADMIN_ROLES))],
 )
 def get_usuario(usuario_id: int) -> dict:
     with get_db() as connection:
@@ -522,9 +785,11 @@ def get_usuario(usuario_id: int) -> dict:
     status_code=status.HTTP_201_CREATED,
     response_model=UsuarioResponse,
     tags=["Usuarios"],
+    dependencies=[Depends(require_roles(*ADMIN_ROLES))],
 )
 def create_usuario(usuario: UsuarioCreate) -> dict:
     with get_db() as connection:
+        _ensure_usuario_name_available(connection, usuario.nombre)
         created_id = execute_insert(
             connection,
             """
@@ -537,7 +802,7 @@ def create_usuario(usuario: UsuarioCreate) -> dict:
             )
             VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
-            (usuario.nombre, _hash_password(usuario.contrasena), usuario.rol),
+            (usuario.nombre, hash_password(usuario.contrasena), usuario.rol),
         )
         return _row_to_dict(_get_usuario_or_404(connection, created_id))
 
@@ -546,10 +811,12 @@ def create_usuario(usuario: UsuarioCreate) -> dict:
     "/usuarios/{usuario_id}",
     response_model=UsuarioResponse,
     tags=["Usuarios"],
+    dependencies=[Depends(require_roles(*ADMIN_ROLES))],
 )
 def update_usuario(usuario_id: int, usuario: UsuarioUpdate) -> dict:
     with get_db() as connection:
         _get_usuario_or_404(connection, usuario_id)
+        _ensure_usuario_name_available(connection, usuario.nombre, usuario_id)
         connection.execute(
             """
             UPDATE usuarios
@@ -561,7 +828,7 @@ def update_usuario(usuario_id: int, usuario: UsuarioUpdate) -> dict:
             """,
             (
                 usuario.nombre,
-                _hash_password(usuario.contrasena),
+                hash_password(usuario.contrasena),
                 usuario.rol,
                 usuario_id,
             ),
@@ -573,6 +840,7 @@ def update_usuario(usuario_id: int, usuario: UsuarioUpdate) -> dict:
     "/usuarios/{usuario_id}",
     response_model=MessageResponse,
     tags=["Usuarios"],
+    dependencies=[Depends(require_roles(*ADMIN_ROLES))],
 )
 def delete_usuario(usuario_id: int) -> dict:
     with get_db() as connection:

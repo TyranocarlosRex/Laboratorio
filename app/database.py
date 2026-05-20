@@ -1,20 +1,9 @@
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from typing import Any, Iterator, Protocol
 
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - optional in simple local installs
-    load_dotenv = None
-
-
-if load_dotenv:
-    load_dotenv()
-
-
-DATABASE_URL = os.getenv("DATABASE_URL")
+from app.config import database_url
 
 
 class CursorLike(Protocol):
@@ -60,11 +49,6 @@ def _to_postgres_placeholders(query: str) -> str:
 
 
 def _connect_postgres() -> DatabaseConnection:
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL es obligatorio. Configura la cadena de conexion PostgreSQL."
-        )
-
     try:
         import psycopg
         from psycopg.rows import dict_row
@@ -73,7 +57,7 @@ def _connect_postgres() -> DatabaseConnection:
             "Falta instalar psycopg. Ejecuta: pip install -r requirements.txt"
         ) from error
 
-    connection = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    connection = psycopg.connect(database_url(), row_factory=dict_row)
     return DatabaseConnection(connection)
 
 
@@ -102,6 +86,11 @@ def execute_insert(
     cursor = connection.execute(f"{query.rstrip()} RETURNING id", params)
     row = cursor.fetchone()
     return int(row["id"])
+
+
+def check_database_ready() -> None:
+    with get_db() as connection:
+        connection.execute("SELECT 1")
 
 
 def _init_postgres(connection: ConnectionLike) -> None:
@@ -150,6 +139,7 @@ def _init_postgres(connection: ConnectionLike) -> None:
         "CREATE INDEX IF NOT EXISTS idx_sustancias_categoria ON sustancias (categoria)",
         "CREATE INDEX IF NOT EXISTS idx_sustancias_nivel_riesgo ON sustancias (nivel_riesgo)",
         "CREATE INDEX IF NOT EXISTS idx_movimientos_id_sustancia ON movimientos (id_sustancia)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_usuarios_nombre_lower ON usuarios (LOWER(nombre))",
     ]
 
     for statement in statements:

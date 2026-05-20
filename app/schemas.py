@@ -144,7 +144,7 @@ class UsuarioBase(BaseModel):
 
 
 class UsuarioCreate(UsuarioBase):
-    contrasena: str = Field(..., min_length=4, examples=["123456"])
+    contrasena: str = Field(..., min_length=8, examples=["clave-segura-123"])
 
 
 class UsuarioUpdate(UsuarioCreate):
@@ -157,6 +157,45 @@ class UsuarioResponse(UsuarioBase):
     updated_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AdminBootstrapCreate(BaseModel):
+    nombre: str = Field(..., min_length=1, examples=["Administrador"])
+    contrasena: str = Field(..., min_length=8, examples=["clave-segura-123"])
+
+    @field_validator("nombre")
+    @classmethod
+    def trim_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("nombre no puede estar vacio")
+        return value
+
+
+class AuthLoginRequest(BaseModel):
+    nombre: str = Field(..., min_length=1, examples=["Administrador"])
+    contrasena: str = Field(..., min_length=8, examples=["clave-segura-123"])
+
+    @field_validator("nombre")
+    @classmethod
+    def trim_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("nombre no puede estar vacio")
+        return value
+
+
+class AuthUserResponse(UsuarioBase):
+    id: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AuthTokenResponse(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    usuario: AuthUserResponse
 
 
 class MessageResponse(BaseModel):
