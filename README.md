@@ -94,6 +94,81 @@ Despues del primer deploy:
 3. Inicia sesion con `POST /auth/login`.
 4. Usa el token para consumir los endpoints protegidos.
 
+## Apps cliente
+
+El repositorio incluye tres clientes en `clients/` que consumen la API desplegada
+en Render:
+
+- `clients/web`: app web React + Vite.
+- `clients/desktop`: app de escritorio Electron para Windows.
+- `clients/mobile`: app movil Android con Capacitor.
+
+Instala dependencias:
+
+```bash
+npm install
+```
+
+La URL por defecto es:
+
+```text
+https://laboratorio-fn54.onrender.com
+```
+
+Tambien se puede cambiar desde la pantalla de acceso de la app. Para compilar con
+otra URL por defecto, usa `VITE_API_BASE_URL`.
+
+### Web
+
+```bash
+npm run web:dev
+npm run web:build
+```
+
+### Escritorio
+
+```bash
+npm run desktop:dev
+npm run desktop:build
+```
+
+El build de Windows queda en:
+
+```text
+clients/desktop/dist/Laboratorio-win32-x64/Laboratorio.exe
+```
+
+### Movil Android
+
+El proyecto Android ya esta generado en `clients/mobile/android`.
+
+Sincroniza el build web con Android:
+
+```bash
+npm run mobile:sync
+```
+
+Para abrir el proyecto:
+
+```bash
+npm run mobile:android
+```
+
+Para compilar APK debug necesitas Android Studio o Android SDK configurado con
+`ANDROID_HOME`. Despues puedes ejecutar:
+
+```bash
+cd clients/mobile/android
+./gradlew assembleDebug
+```
+
+En Windows:
+
+```powershell
+cd clients\mobile\android
+.\gradlew.bat assembleDebug
+```
+
 ## Recursos principales
 
 Los endpoints de inventario y usuarios requieren token JWT en el header:

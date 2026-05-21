@@ -1,0 +1,23 @@
+{
+  "name": "laboratorio-clients",
+  "private": true,
+  "workspaces": [
+    "clients/web",
+    "clients/desktop",
+    "clients/mobile"
+  ],
+  "scripts": {
+    "web:dev": "npm --workspace @laboratorio/web run dev",
+    "web:build": "npm --workspace @laboratorio/web run build",
+    "web:preview": "npm --workspace @laboratorio/web run preview",
+    "desktop:dev": "concurrently -k \"npm --workspace @laboratorio/web run dev\" \"wait-on http://127.0.0.1:5173 && cross-env LABORATORIO_WEB_URL=http://127.0.0.1:5173 npm --workspace @laboratorio/desktop run start\"",
+    "desktop:build": "npm run web:build && npm --workspace @laboratorio/desktop run package",
+    "mobile:sync": "npm run web:build && npm --workspace @laboratorio/mobile run sync",
+    "mobile:android": "npm run web:build && npm --workspace @laboratorio/mobile run android"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "wait-on": "^9.0.1"
+  }
+}

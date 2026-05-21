@@ -1,0 +1,13 @@
+
+> web:dev
+> npm --workspace @laboratorio/web run dev
+
+
+> @laboratorio/web@1.0.0 dev
+> vite --host 127.0.0.1
+
+[2m6:47:46 p.m.[22m [36m[1m[vite][22m[39m [90m[2m(client)[22m[39m Re-optimizing dependencies because lockfile has changed
+
+  [32m[1mVITE[22m v7.3.3[39m  [2mready in [0m[1m1023[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5173[22m/[39m

@@ -1,0 +1,15 @@
+{
+  "name": "@laboratorio/desktop",
+  "private": true,
+  "version": "1.0.0",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "prepare-renderer": "node scripts/copy-web.mjs",
+    "package": "npm run prepare-renderer && electron-packager . Laboratorio --overwrite --out=dist --ignore=dist"
+  },
+  "devDependencies": {
+    "electron": "^39.2.7",
+    "electron-packager": "^17.1.2"
+  }
+}
